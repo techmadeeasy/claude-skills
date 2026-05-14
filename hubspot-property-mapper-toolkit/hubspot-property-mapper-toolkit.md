@@ -1,72 +1,96 @@
 # HubSpot Property Mapper Toolkit
 
-Use this skill when writing or reviewing **Custom code** actions in HubSpot workflows (Operations Hub / Data Hub programmable automation).
+Given a structured mapping file, this skill provisions custom HubSpot properties across one or more object types. It checks for existing properties before creating, making every run safe to re-run against any portal.
 
-## Goals (non-negotiable)
+## Prerequisites
 
-1. **CRM fields come from the record**, not from arbitrary workflow inputs that duplicate HubSpot data.
-   - Prefer **`event.object.objectId`** (and `event.object.objectType` when validating) for the enrolled record's id.
-   - Prefer **Properties to include in code** with variable names equal to HubSpot **internal property names**, each mapped from the **enrolled object** (same pattern as `event.inputFields` in HubSpot docs—values originate from the record, not free-typed secrets).
-   - Use **associations** (v4 Associations API or workflow-supported association inputs) when the needed data lives on related objects—do not ask the user to paste associated record ids unless HubSpot cannot expose them.
+Before starting, confirm both of the following are in place:
 
-2. **Do not require a HubSpot API token** to read CRM properties that the workflow can already inject via **Properties to include in code**. Reserve `process.env` / secrets for **external** systems (e.g. webhook URL, HMAC secret for a non-HubSpot receiver).
+1. **HubSpot MCP is configured and authenticated** for the target portal. All read operations (checking existing properties) go through the MCP. If `get_properties` returns an auth error or the MCP is not connected, stop and ask the user to authenticate before proceeding.
+2. **A mapping file** has been provided (path or content). If not, ask the user for it before doing anything else.
 
-3. **`event.inputFields` is for HubSpot-injected record data**, not a second copy of the CRM. If a key in `inputFields` is not mappable from the enrolled object (or its associations / formatted properties workflow), treat that as a design smell unless explicitly justified.
+Verify MCP connectivity by calling `get_organization_details` — it confirms which portal you are operating against and surfaces the portal name and ID so the user can confirm it is the right one.
 
-## Before writing or approving code: ask these questions
+## Mapping file format
 
-Ask the user (or answer from context). If any answer is wrong, revise the design before pasting code into HubSpot.
+The mapping file is a JSON file with HubSpot object types as top-level keys:
 
-### A. Enrolled object and identity
+```json
+{
+  "contacts": [ ... ],
+  "companies": [ ... ],
+  "deals": [ ... ],
+  "tickets": [ ... ],
+  "line_items": [ ... ]
+}
+```
 
-- **Which object type enrolls this workflow?** (contact / company / deal / custom object) Does the code assume the same type?
-- **Record id:** Will **`event.object.objectId`** always be present at runtime? If yes, **do not require** a separate input named `hs_object_id` unless it is optional redundancy; if you still output `hs_object_id` in a webhook payload, derive it from the injected `hs_object_id` property when mapped, or from `event.object.objectId` when not mapped.
+Each property entry in an array follows HubSpot's property definition schema:
 
-### B. Data sources (catch "unretrievable" inputs)
+```json
+{
+  "name": "internal_property_name",
+  "label": "Display Label",
+  "type": "string",
+  "fieldType": "text",
+  "groupName": "contactinformation",
+  "description": "Optional description",
+  "options": [
+    { "label": "Option A", "value": "option_a", "displayOrder": 0 }
+  ]
+}
+```
 
-For **each** piece of data the action uses:
+**Required fields:** `name`, `label`, `type`, `fieldType`, `groupName`.  
+**`options`** is required only when `type` is `enumeration`.
 
-- **Where does it live in HubSpot?** (property on enrolled object, association, calculated property, owner, etc.)
-- **Can it be passed via "Properties to include in code"** (or associations) so the runtime value is always tied to the enrolled record?
-- If the answer is **no** (e.g. external system id not stored on HubSpot, arbitrary user text, cross-portal constant): is this **intentionally** external configuration? If it is CRM data, stop and redesign (sync field into HubSpot, association, or separate automation).
+Valid `type` values: `string`, `number`, `date`, `datetime`, `enumeration`, `bool`, `phone_number`.  
+Valid `fieldType` values: `text`, `textarea`, `number`, `date`, `file`, `checkbox`, `booleancheckbox`, `radio`, `select`, `phonenumber`.
 
-### C. Secrets and env vars
+## Workflow
 
-List every `process.env.*` usage:
+### Step 1 — Validate the mapping file
+- Parse and validate the JSON.
+- For each property entry, confirm all required fields are present and `type`/`fieldType` combinations are valid.
+- If `type` is `enumeration` and `options` is missing or empty, flag it as an error.
+- Report all validation errors upfront and stop — do not proceed with a broken mapping file.
 
-- **Allowed without extra scrutiny:** URLs and secrets for **non-HubSpot** destinations (e.g. `YOUR_SERVICE_WEBHOOK_URL`, `YOUR_SERVICE_WEBHOOK_SECRET`), or third-party API keys for services HubSpot cannot call natively.
-- **Red flag:** `HUBSPOT_ACCESS_TOKEN` / private app token **only** to read properties of the **same object type that is already enrolled**. Replace with Properties to include in code (and associations) unless there is a documented HubSpot limitation that cannot be worked around.
+### Step 2 — Confirm portal identity
+- Call `get_organization_details` via MCP.
+- Output the portal name and ID and ask the user to confirm this is the correct portal before making any changes.
 
-### D. Associations and read-only fields
+### Step 3 — Check existing properties (via HubSpot MCP)
+For each object type in the mapping file:
+- Call `get_properties` via MCP to retrieve all existing properties for that object type.
+- Build a set of existing internal property `name` values.
+- Diff against the mapping file entries to produce two lists:
+  - **To create** — properties in the mapping file not found on the portal.
+  - **Already exists** — properties already present (will be skipped).
 
-- Does the action need **labels or ids from associated companies/contacts/deals**? Confirm whether workflow "Properties to include in code" or association-based inputs can supply them; otherwise plan an Associations API call **only if** a token is acceptable and scoped—and document why Properties-in-code is insufficient.
+Show the user this diff and confirm before proceeding to creation.
 
-### E. Payload and empties
+### Step 4 — Create missing properties
+For each property in the **to create** list:
+- Use the MCP or the HubSpot Properties API (`POST /crm/v3/properties/{objectType}`) to create the property.
+- Treat a `409 Conflict` response as a no-op (property exists but was not in the MCP results) — log it as skipped.
+- On any other error, log it and continue with the remaining properties — do not abort the entire run.
 
-- If posting a JSON webhook: should **every expected key** always be present (empty string when missing), for downstream stability? Align with team convention.
+### Step 5 — Report results
+Output a summary table when done:
 
-## Implementation checklist
+| Object | Property name | Status |
+|--------|--------------|--------|
+| contacts | my_custom_field | created |
+| contacts | existing_field | skipped (already exists) |
+| deals | deal_stage_reason | created |
+| deals | bad_fieldtype | failed — invalid fieldType |
 
-When producing `exports.main = async (event, callback) => { ... }` style code:
+If any properties failed, list them at the end with the error message so the user can fix and retry.
 
-- [ ] Resolve record id from **`event.object.objectId`**, with optional fallback to mapped `hs_object_id` / `record_id` only if product requires backward compatibility.
-- [ ] Build `properties` from **`event.inputFields`** keys that correspond to HubSpot property names (plus `orderedInputKeys`-style merge if extra mapped keys are allowed).
-- [ ] **No** `axios.get` to `api.hubapi.com` for the enrolled object's own properties unless the user explicitly accepts a private app token and documents why Properties-in-code is insufficient.
-- [ ] Webhook POST (or other external call) may use **`axios`**; keep timeouts and error handling consistent with existing repo patterns.
-- [ ] Document in comments or repo README: required **secrets**, optional secrets, and **which Properties to include in code** (internal names) for each object type.
+## Property naming conventions
+- Use `snake_case` for internal `name` values.
+- Never use the `hs_` prefix — it is reserved for HubSpot system properties.
+- `groupName` must reference a property group that **already exists** on the portal. Do not assume groups are auto-created; if a group is missing, flag it before attempting creation.
 
-## Reference (HubSpot)
-
-- Custom code **`event`** shape: `object`, `inputFields`, `callbackId`, `origin` — see HubSpot docs *Workflows | Custom code actions* (`developers.hubspot.com/docs/api/workflows/custom-code-actions`).
-- **Properties to include in code** are read from `event.inputFields['propertyName']` after mapping from the enrolled record in the action UI.
-
-## Repo examples
-
-If the current repo has existing custom code workflow scripts, locate them (e.g. under `scripts/workflows/`) and align with their patterns before producing new code. Look for:
-
-- How they read the enrolled record id (`event.object.objectId` vs. a mapped input).
-- Which properties are injected via "Properties to include in code" (`event.inputFields`).
-- How secrets / env vars are named and used.
-- Error handling and `callback` invocation style.
-
-If no examples exist yet, treat the first script you write as the canonical pattern and document it here for future reference.
+## Re-runs and idempotency
+Running the skill more than once against the same portal and mapping file is safe. Already-existing properties are always skipped, never overwritten. If you need to update an existing property's label, description, or options, that is out of scope for this skill — use the HubSpot UI or a separate update workflow.
