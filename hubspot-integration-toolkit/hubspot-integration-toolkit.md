@@ -17,9 +17,12 @@ Before writing any file, ask the user all of the following in a single numbered 
 
 1. **Spreadsheet path** — path to the data mapping Excel file (required)
 
-2. **HubSpot private app token** — optional. Two modes:
-   - **With token**: validate/create/fix properties against the live portal, then generate artifacts
-   - **Without token**: generate from spreadsheet only — Postman CREATE requests may fail if properties don't exist in HubSpot yet
+2. **HubSpot private app token** — optional. Three modes depending on what is available:
+   - **No token, no MCP**: generate artifacts from spreadsheet only — Postman CREATE requests may fail if properties don't exist yet
+   - **Token only**: validate/create/fix properties via Node.js scripts, then generate artifacts
+   - **Token + HubSpot MCP** _(best)_: use MCP tools to read portal state directly in the conversation, scripts for write operations — most interactive and reliable
+
+   If a token is provided, also ask: **Is the HubSpot MCP connected in this session?** (The user should have connected it via claude.ai integrations or MCP config before invoking this skill.)
 
 3. **Project / portal name** — used to name output files (e.g. "Acme Corp" → `Acme_Corp_Master_Collection.postman_collection.json`)
 
@@ -65,6 +68,37 @@ Build the object config table from the user's answers and echo it back for confi
 Also derive the **project slug**: lowercase the project name, replace spaces and special characters with underscores (e.g. "Acme Foods" → `acme_foods`). Show it to the user.
 
 Wait for the user to confirm before writing any code.
+
+---
+
+## Step 2b — Portal Recon (token + MCP mode only)
+
+If the user confirmed both a token and an active HubSpot MCP connection, use the MCP tools to inspect the portal **before** scaffolding any scripts. This gives you ground truth about what already exists and avoids unnecessary script runs.
+
+**Run these MCP lookups:**
+
+1. `mcp__*_HubSpot__get_organization_details` — confirm you are connected to the correct portal (name, portal ID). Show the portal name to the user and ask them to confirm before proceeding.
+
+2. For each object type in the config table, call `mcp__*_HubSpot__get_properties` with the API slug — get the full list of existing properties.
+
+3. Cross-reference the spreadsheet mappings against the MCP results:
+   - **Exists and type matches** → MATCH ✓
+   - **Exists but wrong type** → TYPE_MISMATCH ⚠️
+   - **Does not exist** → MISSING ✗
+
+4. Present the results as a per-object summary table before touching anything:
+   ```
+   Company — 19 spreadsheet properties
+     ✓ 16 matched
+     ⚠️  2 type mismatch  (will delete + recreate — existing data will be lost)
+     ✗  1 missing         (will be created)
+   ```
+
+5. For TYPE_MISMATCH entries: warn the user explicitly that fixing them **permanently deletes the existing property data** in the portal. Require a `yes` before proceeding.
+
+6. After the user confirms, use `mcp__*_HubSpot__search_properties` to verify individual property details where needed, then proceed to scaffolding and running the validate-properties.js scripts for write operations.
+
+**If MCP is not connected** (token only): skip this step entirely and proceed to Step 3. The validate-properties.js script will handle portal inspection via the API.
 
 ---
 
@@ -446,6 +480,10 @@ For Deal: remind the user to create **two separate workflows** in HubSpot using 
 ---
 
 ## Non-Negotiable Rules
+
+- **When HubSpot MCP is connected, always use it for read operations first** — confirm portal identity (`get_organization_details`) before touching anything, then use `get_properties` to check existing state rather than inferring it from the spreadsheet alone. MCP reads are faster and more reliable than running a script and parsing its output.
+- **MCP is read-only for property management** — it cannot create or modify properties. Use the Node.js scripts (with `--create` / `--fix-mismatched`) or the HubSpot API directly for write operations.
+- **Always confirm portal identity before portal actions** — show the portal name from `get_organization_details` and get a `yes` from the user before creating or modifying any properties.
 
 - **sanitizeName every internal name** before use in any output. HubSpot rejects uppercase letters and characters outside `[a-z0-9_]`.
 - **hubspot_owner_id never appears in CREATE or UPDATE bodies** in the Postman collection.

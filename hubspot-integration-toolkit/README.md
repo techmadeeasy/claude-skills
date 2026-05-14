@@ -21,6 +21,47 @@ Optionally, if a HubSpot private app token is provided, the skill will also:
 - Node.js 18+ and npm
 - A HubSpot data mapping spreadsheet (Excel `.xlsx`) with a **"Ready to Build"** sheet
 
+### HubSpot MCP — required for token mode (portal actions)
+
+When you want Claude to validate, create, or fix properties directly on a live HubSpot portal, the **HubSpot MCP integration must be connected** before invoking the skill. The MCP gives Claude direct read access to the portal (properties, objects, owners, org details) and is used alongside the private app token — MCP for reading portal state, the token for write operations.
+
+**Option A — claude.ai integrations (recommended)**
+
+1. Go to [claude.ai](https://claude.ai) → Settings → Integrations
+2. Find **HubSpot** and click Connect
+3. Authenticate with your HubSpot account
+4. The MCP will be available in all Claude Code sessions that use your claude.ai account
+
+**Option B — Claude Code MCP config (self-hosted / local)**
+
+Add the HubSpot MCP server to your Claude Code MCP configuration (`~/.claude/claude.json` or `.mcp.json` in the project root):
+
+```json
+{
+  "mcpServers": {
+    "hubspot": {
+      "command": "npx",
+      "args": ["-y", "@hubspot/mcp-server"],
+      "env": {
+        "HUBSPOT_ACCESS_TOKEN": "pat-na1-your-token-here"
+      }
+    }
+  }
+}
+```
+
+**What the MCP enables**
+
+| Capability | Without MCP | With MCP |
+|---|---|---|
+| Read existing portal properties | via script only | directly in conversation |
+| Verify object/property existence | via script output | directly in conversation |
+| Look up owners, org details | not available | available |
+| Create / fix properties | via script (`--create`, `--fix-mismatched`) | script + MCP verification |
+| Generate Postman + workflow files | ✓ | ✓ |
+
+Without the MCP, the skill still works in token mode — it runs Node.js scripts to validate and create properties. The MCP makes the process more interactive and lets Claude reason about the portal state without requiring a script run for every lookup.
+
 ### Expected spreadsheet columns
 
 | Column | Index | Content |
@@ -74,11 +115,13 @@ The skill will ask 9 clarifying questions in a single message before touching an
 
 It then echoes back an object config table for confirmation before writing any files.
 
-## Two modes
+## Three modes
 
-**Without a token** — generates all artifacts from the spreadsheet alone. Postman CREATE/UPDATE requests will fail if the properties don't yet exist in HubSpot. Useful for generating a draft and reviewing before touching the portal.
+**Generate only (no token, no MCP)** — generates all artifacts from the spreadsheet alone. Postman CREATE/UPDATE requests may fail if the properties don't yet exist in HubSpot. Useful for drafting and reviewing before touching the portal.
 
-**With a token** — validates properties against the live portal first. Reports missing and type-mismatched properties, then asks for confirmation before creating or fixing them. Recreates the full toolkit once the portal state is clean.
+**Token only** — validates properties against the live portal by running Node.js scripts. Reports missing and type-mismatched properties, then asks for confirmation before creating or fixing them. Recreates the full toolkit once the portal state is clean.
+
+**Token + HubSpot MCP** _(recommended for active portal work)_ — the MCP gives Claude direct read access to the portal inside the conversation. Claude can look up existing properties, verify object schemas, and check org details without waiting for a script run. Combined with the token for write operations (create/fix), this is the most interactive and reliable mode. **The HubSpot MCP must be connected before invoking the skill** — see prerequisites above.
 
 ## Output structure
 
