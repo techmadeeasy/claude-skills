@@ -137,6 +137,43 @@ It then echoes back an object config table for confirmation before writing any f
     └── {ProjectSlug}_Webhook_Schema.json
 ```
 
+## Project history and change tracking
+
+Every session writes a history log to `.hubspot-integration/history.json` in the project directory. This file tracks:
+
+- **Sessions** — a timestamped record of every action taken (properties created/fixed, artifacts generated, validations run)
+- **Property registry** — the full change history of every property that was touched, including side effects (e.g. calculated properties that were deleted)
+- **Pending items** — unresolved issues carried forward between sessions (missing internal names, dropdown options still needed, skipped mismatches)
+
+### How it helps
+
+On every subsequent invocation the skill loads this file first and uses it to:
+
+| Situation | Behaviour |
+|---|---|
+| A property was previously fixed (deleted + recreated) | Escalates the warning before fixing it again — "all data stored since {date} will be lost" |
+| A property appears in the pending list | Confirms with the user before creating it — "this was flagged as pending, confirm it resolves the issue" |
+| Artifacts are about to be regenerated | Reports what changed since the last generation |
+| The find key is about to change | Warns that downstream consumers using the old key will break |
+| Dropdown options were pending client input | Asks for confirmation that the options are now finalised |
+
+### History compaction
+
+The history file is kept lean automatically. After every session write, the skill checks two thresholds:
+
+- More than **5 sessions** in the log, or
+- File exceeds **8 000 characters** (~2 000 tokens)
+
+If either is true it compacts: the oldest sessions are collapsed into a single `compacted_history` prose summary, only the 3 most recent sessions are kept in full, and the property registry is trimmed to one entry per property (the current state + most recent event). The only entries that are **never discarded** are side effects (e.g. a calculated property that was permanently deleted) — those stay on record regardless of age or file size.
+
+### Committing the history file
+
+The `.hubspot-integration/` directory should be committed alongside your project. It gives the whole team visibility into what has been done on the portal and what is still outstanding — without needing to read through session logs.
+
+Add to `.gitignore` anything sensitive (tokens, `.env`), but keep the history file tracked.
+
+---
+
 ## HubSpot workflow setup (after generation)
 
 For each generated workflow file:

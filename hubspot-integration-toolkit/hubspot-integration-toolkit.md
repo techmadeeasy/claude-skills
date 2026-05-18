@@ -11,6 +11,40 @@ You are executing the `/hubspot-integration` skill. Your job is to scaffold a No
 
 ---
 
+## Step 0 — Load Project History
+
+Before asking any questions, check for a history file at `.hubspot-integration/history.json` in the current working directory.
+
+**If the file does not exist:** proceed silently to Step 1. This is a fresh project.
+
+**If the file exists:** load it and present a session briefing before asking anything else. Format:
+
+```
+── Integration History ────────────────────────────────
+Project : {project}
+Portal  : {portal_name} (ID: {portal_id})
+Sessions: {count} prior session(s), last on {last_updated}
+
+Last session summary:
+  {last session summary line}
+
+Pending items carried forward:
+  ⚠️  {object} — {issue}
+  ⚠️  {object} — {issue}
+
+Property changes on record:
+  {object}.{property} — {last event} on {date} {note if side effects}
+──────────────────────────────────────────────────────
+```
+
+Then ask: **"Continue from where this project left off, or start fresh?"**
+- Continue → carry the existing config forward; skip any Step 1 questions already answered in history
+- Fresh → proceed to Step 1 as normal (history file will be archived, not deleted)
+
+**Consequence check on load:** scan the pending items and property registry. If any pending items reference properties the user is about to act on in this session, surface them proactively before those actions are taken.
+
+---
+
 ## Step 1 — Gather Requirements (one message, wait for answers)
 
 Before writing any file, ask the user all of the following in a single numbered list. If `$ARGUMENTS` is non-empty, treat it as the spreadsheet path and skip Q1.
@@ -449,9 +483,25 @@ Show a per-object summary: matched / mismatched / missing counts.
 
 **Before running --create:** confirm with user. Missing properties will be created.
 
-**Before running --fix-mismatched:** warn the user that fixing type mismatches **deletes existing property data** in the portal. Require explicit confirmation. Then run:
+**Before running --fix-mismatched:** cross-check each mismatched property against the history file's `property_registry` **before** warning the user. If the property has a prior `fixed` event in history, escalate the warning:
+
+```
+⚠️  HISTORY ALERT — {object}.{property_name}
+    This property was already fixed on {date} (changed from {fromType} → {toType}).
+    A calculated property '{name}' was permanently deleted as a side effect at that time.
+    Fixing it again will delete all data stored in this property since {date}.
+    Are you sure you want to proceed?
+```
+
+If no prior history: use the standard warning that fixing deletes existing property data. Require explicit confirmation either way. Then run:
 ```bash
 node src/validate-properties.js -s "{spreadsheetPath}" --fix-mismatched
+```
+
+**Before adding a property that appears in pending items:** confirm with the user that it's intentional and matches what was deferred in the last session. Example:
+```
+ℹ️  HISTORY NOTE — {object}.{property_name} was flagged as pending in the last session
+    ({reason}). This action will resolve that pending item — confirm?
 ```
 
 After any create/fix pass, re-run validation to confirm.
@@ -479,8 +529,173 @@ For Deal: remind the user to create **two separate workflows** in HubSpot using 
 
 ---
 
+## Step 7 — Update Project History
+
+After every session — whether artifacts were generated, properties were changed, or just a validation was run — write or update `.hubspot-integration/history.json`.
+
+Create the `.hubspot-integration/` directory if it does not exist. Never delete the history file; only append and update.
+
+### History file schema
+
+```json
+{
+  "project": "project_slug",
+  "portal_id": "12345678",
+  "portal_name": "Acme Corp HubSpot",
+  "created_at": "ISO-8601 timestamp of first session",
+  "last_updated": "ISO-8601 timestamp of this session",
+  "sessions": [
+    {
+      "date": "ISO-8601 timestamp",
+      "summary": "One-line human description of what happened",
+      "actions": [
+        {
+          "type": "property_created",
+          "object": "companies",
+          "name": "source_object_name",
+          "fieldType": "Dropdown select",
+          "options": ["MASTERCHAIN", "CHAIN", "STOP", "DEPARTMENT"]
+        },
+        {
+          "type": "property_fixed",
+          "object": "companies",
+          "name": "stop_no",
+          "fromType": "string",
+          "toType": "number",
+          "sideEffects": ["Calculated property 'stop' permanently deleted — depended on this property"]
+        },
+        {
+          "type": "artifacts_generated",
+          "artifacts": ["postman", "workflows", "schema"],
+          "spreadsheet": "mapping.xlsx",
+          "propertyCount": { "companies": 19, "deals": 12, "products": 21 }
+        },
+        {
+          "type": "validation_run",
+          "results": { "companies": { "matched": 16, "mismatched": 2, "missing": 1 } }
+        }
+      ]
+    }
+  ],
+  "pending": [
+    {
+      "object": "deals",
+      "type": "missing_internal_names",
+      "properties": ["region", "territory", "shipping_country"],
+      "note": "No HubSpot internal name in col M — properties cannot be created until spreadsheet is updated"
+    },
+    {
+      "object": "companies",
+      "type": "pending_options",
+      "properties": ["erp_active"],
+      "note": "Dropdown options not yet defined — client input required before middleware can validate values"
+    }
+  ],
+  "property_registry": {
+    "companies": {
+      "stop_no": {
+        "currentType": "number",
+        "history": [
+          {
+            "date": "ISO-8601",
+            "event": "fixed",
+            "fromType": "string",
+            "toType": "number",
+            "sideEffects": ["Calculated property 'stop' permanently deleted"]
+          }
+        ]
+      },
+      "source_object_name": {
+        "currentType": "enumeration",
+        "history": [
+          { "date": "ISO-8601", "event": "created", "fieldType": "Dropdown select" }
+        ]
+      }
+    }
+  }
+}
+```
+
+### Compaction policy
+
+After writing the new session entry, check whether the history file needs compacting.
+
+**Trigger compaction when either condition is true:**
+- `sessions` array has more than **5 entries**, OR
+- The JSON string length of the file exceeds **8 000 characters** (≈ 2 000 tokens)
+
+**Compaction algorithm:**
+
+1. Sort `sessions` by date ascending. Keep the **3 most recent** sessions in full detail. Collapse everything older into a single `compacted_history` block:
+
+```json
+"compacted_history": {
+  "up_to": "ISO-8601 date of the last compacted session",
+  "sessions_count": 7,
+  "summary": "Prose summary of all compacted sessions — what was created, fixed, generated, and any permanent side effects (e.g. calculated properties deleted). Be specific about side effects; be brief about routine runs."
+}
+```
+
+2. **Property registry** — for each property, keep:
+   - `currentType` — always
+   - The **most recent history entry** — always
+   - Any entry that has a non-empty `sideEffects` array — always (side effects are permanent facts, never discard them)
+   - Discard all other older history entries
+
+3. **Pending items** — remove any item that has been resolved. Keep only genuinely open items.
+
+4. Never shrink the file below a viable state. If after compaction the `sessions` array is empty, that means all sessions were compacted — that is fine as long as `compacted_history` exists.
+
+**What must never be discarded regardless of file size:**
+- Any `sideEffects` entry (e.g. a calculated property was permanently deleted)
+- The `property_registry` current state for every property ever touched
+- All currently open `pending` items
+- The `compacted_history` block once it exists — never delete it, only update it
+
+**After compaction**, verify the resulting JSON is valid and write it back. Log a one-line note at the end of the session report: `"History compacted — {N} sessions summarised, file reduced to ~{char_count} chars."`
+
+---
+
+### What to log per action type
+
+| Action | Log when |
+|--------|----------|
+| `property_created` | A missing property was created via `--create` |
+| `property_fixed` | A mismatched property was deleted + recreated via `--fix-mismatched` — always include `sideEffects` if a calculated property was deleted |
+| `property_skipped` | A property was identified as mismatched or missing but the user chose not to act on it this session |
+| `artifacts_generated` | Any generator script ran successfully — include which artifacts and property counts |
+| `validation_run` | A validation-only pass ran (no --create or --fix) |
+| `spreadsheet_updated` | The user updated the spreadsheet (e.g. added col M values) during the session |
+
+### Pending items maintenance
+
+- **Add** a pending item when: a property is skipped, col M is blank for tracked rows, or dropdown options are missing
+- **Remove** a pending item when: the issue is resolved (property created, options defined, etc.)
+- Keep the pending list accurate — stale pending items erode trust in the history
+
+### Consequence checks powered by history
+
+When the user requests any of the following in a future session, check history first and surface the relevant context before acting:
+
+| User request | History check | Warning to show |
+|---|---|---|
+| Fix a type mismatch | `property_registry[object][name].history` has a `fixed` event | "Already fixed on {date} — refixing deletes data accumulated since then" |
+| Create a property | `pending` list | "This was flagged as pending — confirm this resolves it" |
+| Change find key | `sessions[].actions` where `artifacts_generated` used a different find key | "Postman collection was last generated with find key {old} — update any downstream consumers" |
+| Regenerate artifacts | Last `artifacts_generated` action | "Last generated on {date} with {N} properties. {M} properties have been added/changed since then — confirm regeneration" |
+| Add options to a dropdown | `pending` list with `type: pending_options` | "This was flagged as pending client input — confirm the options are now finalised before adding them" |
+
+---
+
 ## Non-Negotiable Rules
 
+- **Always load history before doing anything** — `.hubspot-integration/history.json` is the source of truth for what has been done, what is pending, and what side effects to expect. Never skip Step 0.
+- **Always write history at the end of every session** — even if only a validation was run. An unwritten session is a lost session.
+- **Always compact after writing** — check the two thresholds every time. A history file that grows unchecked becomes token-expensive and defeats its own purpose.
+- **Side effects are permanent record** — never discard a `sideEffects` entry from the property registry, even during aggressive compaction. They document irreversible changes to the portal.
+- **Never delete the history file** — if the user wants a fresh start, archive the existing file (rename with a timestamp suffix) rather than deleting it.
+- **Surface history consequences proactively** — don't wait for the user to ask. If a requested action touches something with a history entry, show the relevant context before proceeding.
+- **Keep pending items accurate** — resolve them when fixed, add them when discovered. A stale pending list is worse than no list.
 - **When HubSpot MCP is connected, always use it for read operations first** — confirm portal identity (`get_organization_details`) before touching anything, then use `get_properties` to check existing state rather than inferring it from the spreadsheet alone. MCP reads are faster and more reliable than running a script and parsing its output.
 - **MCP is read-only for property management** — it cannot create or modify properties. Use the Node.js scripts (with `--create` / `--fix-mismatched`) or the HubSpot API directly for write operations.
 - **Always confirm portal identity before portal actions** — show the portal name from `get_organization_details` and get a `yes` from the user before creating or modifying any properties.
